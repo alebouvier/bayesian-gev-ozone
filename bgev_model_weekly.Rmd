@@ -1,0 +1,963 @@
+---
+title: "bGEV model with weekly data"
+author: "Alexandre Bouvier"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Tools
+
+```{r}
+library(INLA)
+library(evd)
+```
+
+```{r}
+giveme.gev.par = function(q, sbeta, alpha, beta, xi) 
+{
+  .mu = function(q, sbeta, alpha, beta, xi) {
+    a = -log(1-beta/2)
+    b = -log(beta/2)
+    c = -log(alpha)
+    if (all(xi > 0.0)) {
+      tmp0 = (c^(-xi) - 1)/xi
+      tmp1 = a^(-xi)
+      tmp2 = b^(-xi)
+      dbeta = (tmp1 - tmp2)/xi
+      return(q - (sbeta/dbeta) * tmp0)
+    } else if (all(xi == 0.0)) {
+      dbeta = log(b) - log(a)
+      tmp0 = log(c)
+      return(q + (sbeta/dbeta) * tmp0)
+    } else {
+      stop("mixed case not implemented")
+    }
+  }
+  
+  .sigma = function(q, sbeta, alpha, beta, xi) {
+    a = -log(1-beta/2)
+    b = -log(beta/2)
+    if (all(xi > 0.0)) {
+      tmp1 = a^(-xi)
+      tmp2 = b^(-xi)
+      dbeta = (tmp1 - tmp2)/xi
+      return(sbeta/dbeta)
+    } else if (all(xi == 0.0)) {
+      dbeta = log(b) - log(a)
+      return(sbeta/dbeta)
+    } else {
+      stop("mixed case not implemented")
+    }
+  }
+  
+  return(list(mu = .mu(q, sbeta, alpha, beta, xi),
+              sigma = .sigma(q, sbeta, alpha, beta, xi),
+              xi = xi))
+}
+```
+
+```{r}
+map.tail = function(x, interval, inverse = FALSE) {
+  if (!inverse) {
+    return (interval[1] + (interval[2] - interval[1]) * exp(x)/(1.0 + exp(x)))
+  } else {
+    return (log((x-interval[1])/(interval[2]-x)))
+  }
+}
+```
+
+
+# bGEV model for maximum Ozone
+
+## Load data
+```{r}
+data = read.csv("./weekly_ozone_and_covariates.csv")
+summary(data)
+```
+
+```{r}
+attach(data)
+n = dim(data)[1]
+```
+
+##Define priors for the tail parameter 
+
+The tail parameter of a GEV-type distribution must stay in an interval.
+INLA uses an internal parametrisation, so we map an initial guess to internal scale.
+
+```{r}
+tail.interval = c(0, 0.5)
+tail.intern = map.tail(0.1, tail.interval, inverse=TRUE)
+```
+
+```{r}
+hyper.tail = list(initial = tail.intern, 
+                  prior = "pc.gevtail",
+                  param = c(7, tail.interval), 
+                  fixed= FALSE)
+```
+
+##Prior for the scale (spread) parameter
+
+```{r}
+hyper.spread = list(prior = "loggamma",
+                  param = c(3, 3),
+                  initial = 1,
+                  fixed = FALSE)
+```
+
+
+##Regression priors for spread covariates 
+
+These are regression coefficients affecting  the spread of the bGEV.
+```{r}
+hyper.beta1 = hyper.beta2 = hyper.beta3 = hyper.beta4 = list(prior = "normal",
+                  param = c(0, 1),
+                  initial = 0)
+```
+
+
+##Assemble all bGEV hyperparameters
+
+```{r}
+hyper.bgev = list(
+                  tail = hyper.tail,
+                  spread = hyper.spread,
+                  beta1 = hyper.beta1,
+                  beta2 = hyper.beta2,
+                  beta3 = hyper.beta3,
+                  beta4 = hyper.beta4)
+```
+
+
+## Define quantile-based parametrisation
+```{r}
+p.alpha = 0.5 # median
+p.beta = 0.5 # 50% interval
+```
+
+## Control list for the bGEV family
+
+```{r}
+control.bgev = list(q.location = p.alpha,
+                    q.spread = p.beta,
+                    # quantile levels for the mixing part
+                    q.mix= c(0.05, 0.20), 
+                    # the Beta(s1, s2) mixing distribution parameters. 
+                    # Hard-coded for the moment: s1=s2=5
+                    beta.ab = 5)
+```
+
+## scale the covariates
+
+```{r}
+data$minTemp   <- as.numeric(scale(data$minTemp))
+data$maxTemp   <- as.numeric(scale(data$maxTemp))
+data$windSpeed <- as.numeric(scale(data$windSpeed))
+data$rainSum   <- as.numeric(scale(data$rainSum))
+
+```
+
+
+## Extract year and month
+
+```{r} 
+data$year = as.numeric(format(as.Date(data$week), "%Y")) - 2018
+data$month = as.numeric(format(as.Date(data$week), "%m"))
+```
+
+## Train/test split
+
+```{r}
+train.mask = data$year + 2018 < 2024
+station.filter = data$idSensor <= 9991
+
+data.train = data[train.mask & station.filter,]
+data.test = data[!train.mask & station.filter,]
+```
+
+## Tail covariates (empty)
+
+we do not model covariates on the tail, so this is an empty matrix.
+
+```{r}
+tail.x = matrix(1, nrow(data.train), 1)
+```
+
+## Spread covariates & formula
+
+```{r}
+
+spread.x <- cbind(
+  maxTemp_spread  = data.train$maxTemp,
+  minTemp_spread  = data.train$minTemp,
+  windSpeed_spread = data.train$windSpeed,
+  rainSum_spread  = data.train$rainSum
+)
+
+
+formula = inla.mdata(maxOzone, spread.x, tail.x) ~ -1 + intercept + minTemp + maxTemp + windSpeed + rainSum
+
+```
+
+
+## build INLA input
+
+```{r}
+data.bgev = data.frame(data.train, 
+                       intercept = 1,
+                       spread.x = spread.x,
+                       tail.x = tail.x)
+```
+
+
+##Fit the model
+```{r}
+fit.bgev.1 = inla(formula,
+         family = "bgev",
+         data = data.bgev,
+         control.family = list(hyper = hyper.bgev,
+                               control.bgev = control.bgev),
+         control.fixed = list(prec=1),
+         control.predictor = list(compute = TRUE),
+        control.compute   = list(cpo = T, dic = F, waic = T, config = F),
+        control.inla = list(int.strategy = "eb", strategy = "simplified.laplace"),
+         verbose=FALSE)
+```
+
+## Save and reload the model
+
+```{r}
+saveRDS(fit.bgev.1, file = "bGEV_weekly_model_32_stations.rds")
+```
+
+```{r}
+fit.bgev.1 = readRDS(file = "bGEV_weekly_model_32_stations.rds")
+```
+
+
+## Inspect fixed effects & hyperparameters
+
+```{r}
+round(fit.bgev.1$summary.fixed,4)
+
+```
+
+
+```{r}
+round(fit.bgev.1$summary.hyperpar,4)
+
+```
+
+## Plot fixed effects with confidence intervals
+
+```{r}
+library(ggplot2)
+
+fixed <- fit.bgev.1$summary.fixed
+fixed$param <- rownames(fixed)
+
+ggplot(fixed, aes(x = param, y = mean)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = `0.025quant`, ymax = `0.975quant`)) +
+  geom_hline(yintercept = 0, size=0.5, color="red") +
+  ggtitle("location parameters heteroskedastic model") +
+  coord_flip()
+```
+
+
+## PIT histogram (model checking)
+
+```{r}
+hist(fit.bgev.1$cpo$pit, breaks = 50, main = "PIT histogram", xlab = "PIT")
+
+```
+
+## Plot marginal posterior hyperparameters
+
+```{r}
+plot_marginal <- function(marg, main="") {
+  plot(
+    marg,
+    type = "l",
+    lwd = 2,
+    xlab = "Parameter value",
+    ylab = "Density",
+    main = main
+  )
+}
+par(mfrow=c(2,3))
+
+plot_marginal(fit.bgev.1$marginals.hyperpar[["spread for BGEV observations"]], "Spread")
+plot_marginal(fit.bgev.1$marginals.hyperpar[["tail for BGEV observations"]], "Tail")
+
+plot_marginal(fit.bgev.1$marginals.hyperpar[["beta1 (spread) for BGEV observations"]], "MaxTemp: effect on spread")
+plot_marginal(fit.bgev.1$marginals.hyperpar[["beta2 (spread) for BGEV observations"]], "MinTemp: effect on spread")
+plot_marginal(fit.bgev.1$marginals.hyperpar[["beta3 (spread) for BGEV observations"]], "WindSpeed: effect on spread")
+plot_marginal(fit.bgev.1$marginals.hyperpar[["beta4 (spread) for BGEV observations"]], "RainSum: effect on spread")
+
+
+```
+
+## Predictions
+
+```{r}
+
+
+spread.x <- cbind(
+  maxTemp_spread  = data.test$maxTemp,
+  minTemp_spread  = data.test$minTemp,
+  windSpeed_spread = data.test$windSpeed,
+  rainSum_spread  = data.test$rainSum
+)
+
+tail.x = matrix(1, nrow(data.test), 1)
+
+
+data.pred.bgev = data.frame(data.test, 
+                       intercept = 1,
+                       spread.x = spread.x,
+                       tail.x = tail.x)
+```
+
+
+
+```{r}
+pred.bgev = inla(
+  formula,
+  family = "bgev",
+  data = data.pred.bgev,
+  control.family    = list(hyper = hyper.bgev,
+                               control.bgev = control.bgev),
+  control.mode      = list(theta = fit.bgev.1$mode$theta, restart = FALSE),
+  control.predictor = list(compute = TRUE),
+  control.compute   = list(config = TRUE),  # required for samples
+  control.inla      = list(strategy = "simplified.laplace", int.strategy = "eb"),
+  verbose = F
+)
+```
+
+
+```{r}
+pred_mean = pred.bgev$summary.fitted.values$mean
+pred_lower = pred.bgev$summary.fitted.values$`0.025quant`
+pred_upper = pred.bgev$summary.fitted.values$`0.975quant`
+
+pred.df.1 = data.frame(
+  idSensor = data.test$idSensor,
+  date  = as.Date(data.test$week),
+  observed = data.test$maxOzone,
+  pred_mean  = pred_mean,
+  pred_lower = pred_lower,
+  pred_upper = pred_upper
+)
+
+
+```
+
+
+```{r}
+
+ggplot(pred.df.1[pred.df.1$idSensor == 5707,], aes(x = date, group=idSensor)) +
+  geom_line(aes(  y = observed, colour = "observed")) +
+  geom_line(aes( y = pred_mean, colour = "predicted")) +
+  geom_ribbon(aes(ymin = pred_lower, ymax = pred_upper), alpha = 0.2) +
+  ggtitle("sensor 5707: Heteroskedastic model")
+```
+
+
+## --- Predictive intervals via posterior simulation ---
+
+Predictive intervals quantify the full uncertainty of future observations by combining parameter uncertainty and the inherent variability of the process.
+Unlike confidence intervals on model parameters, they indicate the range in which new observations are expected to fall with a given probability.
+
+```{r}
+library(sn)
+
+set.seed(123)
+n_sims <- 1000
+
+# Draw posterior samples of the latent predictor
+samples <- inla.posterior.sample(
+  n = n_sims,
+  result = pred.bgev
+)
+
+# Extract linear predictors
+eta_samples <- sapply(samples, function(s)
+  s$latent[grep("^Predictor", rownames(s$latent))]
+)
+
+# Posterior means of hyperparameters
+xi_hat    <- fit.bgev.1$summary.hyperpar["tail for BGEV observations","mean"]
+sigma_hat <- fit.bgev.1$summary.hyperpar["spread for BGEV observations","mean"]
+
+# Simulate observations
+y_rep <- matrix(NA, nrow = n_sims, ncol = nrow(eta_samples))
+
+for (i in 1:n_sims) {
+  mu_i <- eta_samples[, i]
+  y_rep[i, ] <- rgev(
+    length(mu_i),
+    loc   = mu_i,
+    scale = sigma_hat,
+    shape = xi_hat
+  )
+}
+
+# Predictive intervals
+pred_PI <- apply(y_rep, 2, quantile, probs = c(0.025, 0.5, 0.975))
+
+pred.df$pred_PI_lower <- pred_PI[1, ]
+pred.df$pred_PI_median <- pred_PI[2, ]
+pred.df$pred_PI_upper <- pred_PI[3, ]
+```
+
+```{r}
+ggplot(pred.df[pred.df$idSensor == 5707,], aes(x = date)) +
+  geom_line(aes(y = observed, colour = "observed") )+
+  geom_line(aes(y = pred_PI_median, colour = "predicted") )+
+  geom_ribbon(
+    aes(ymin = pred_PI_lower, ymax = pred_PI_upper),
+    fill = "blue", alpha = 0.3
+  ) +
+  ggtitle("Predictive intervals (sensor 5707)")
+```
+The predicted mean captures the seasonal ozone pattern well. Predictive intervals are wide, which is expected for extreme-value models and reflect natural variability. Most observations lie within the intervals, indicating good overall predictive calibration.
+
+## --- GEV Probability Integral Transform ---
+
+Q–Q (PIT) plots assess how well the model’s predicted distribution matches the observed data.
+Points close to the diagonal indicate good calibration, while systematic deviations reveal under- or overestimation in certain parts of the distribution.
+
+```{r}
+mu_hat <- pred.bgev$summary.fitted.values$mean
+xi_hat <- fit.bgev.1$summary.hyperpar["tail for BGEV observations","mean"]
+sigma_hat <- fit.bgev.1$summary.hyperpar["spread for BGEV observations","mean"]
+
+pit_gev <- pgev(
+  pred.df$observed,
+  loc   = mu_hat,
+  scale = sigma_hat,
+  shape = xi_hat
+)
+
+qqplot(
+  qunif(ppoints(length(pit_gev))),
+  sort(pit_gev),
+  main = "GEV Q–Q plot (PIT)",
+  xlab = "Theoretical quantiles",
+  ylab = "Empirical PIT"
+)
+abline(0, 1, col = "red")
+```
+Center: points are close to the diagonal
+→ the model is well calibrated for typical values.
+
+Lower probabilities (left tail): points lie above the diagonal
+→ the model slightly overestimates low values (lower tail too heavy).
+
+Higher probabilities (right tail): points lie below the diagonal
+→ the model underestimates extreme high values (upper tail too light).
+
+## --- Extreme quantile coverage ---
+
+Coverage at a given quantile (e.g., 95%) measures the proportion of observed values below that predictive quantile.
+Values close to the nominal probability indicate well-calibrated extremes, while values too high or low reveal over- or underestimation.
+
+```{r}
+q95 <- qgev(
+  0.95,
+  loc   = mu_hat,
+  scale = sigma_hat,
+  shape = xi_hat
+)
+
+coverage_95 <- mean(pred.df$observed <= q95)
+
+coverage_95
+```
+coverage_95 = 1 means that all observations fall below the model’s 95% predictive quantile.
+This indicates an overly conservative model, with the upper tail (or dispersion) being overestimated.
+
+
+# Temporal Model
+
+## Set the tail prior
+
+```{r}
+tail = 0.08
+tail.interval = c(0, 0.5)
+tail.intern = map.tail(tail, tail.interval, inverse=TRUE)
+```
+
+## PC prior for the tail
+
+```{r}
+lambda = 7
+
+hyper.tail = list(initial = tail.intern, 
+                  prior = "pc.gevtail",
+                  param = c(lambda, tail.interval), 
+                  fixed= FALSE)
+```
+
+## Prior for the spread
+
+```{r}
+hyper.spread = list(prior = "loggamma",
+                  param = c(3, 3),
+                  initial = 1,
+                  fixed = FALSE)
+```
+
+
+## Combine hyperparameters for the bGEV family
+
+```{r}
+hyper.bgev = list(
+                  tail = hyper.tail,
+                  spread = hyper.spread)
+```
+
+
+## bGEV model-specific quantile and mixing settings
+
+```{r}
+
+## bGEV hyperparameters 
+p.alpha = 0.5  # alpha for q_alpha
+p.beta  = 0.5 # beta for s_beta
+pa  = 0.05 # Probability pa for the mixing region
+pb  = 0.2  # Probability pb for the mixing region
+c1  = 5    # parameters of the Beta weight function. Hard-coded for the moment: c1=c2=5
+```
+
+
+```{r}
+control.bgev = list(q.location = p.alpha,
+                    q.spread   = p.beta,
+                    q.mix      = c(pa, pb), 
+                    beta.ab    = c1)
+```
+
+
+## scale the covariates
+
+```{r}
+data$minTemp   <- as.numeric(scale(data$minTemp))
+data$maxTemp   <- as.numeric(scale(data$maxTemp))
+data$windSpeed <- as.numeric(scale(data$windSpeed))
+data$rainSum   <- as.numeric(scale(data$rainSum))
+
+```
+
+
+## Extract year and month
+
+```{r} 
+data$year = as.numeric(format(as.Date(data$week), "%Y")) - 2018
+data$month = as.numeric(format(as.Date(data$week), "%m"))
+```
+
+## Train/test split
+
+```{r}
+train_mask = data$year + 2018 < 2024
+station.filter = data$idSensor <= 9991
+
+data.train = data[train_mask & station.filter,]
+data.test = data[!train_mask & station.filter,]
+```
+
+## Prior for monthly seasonal effect
+
+```{r}
+cyclic      = T
+hyper.month = list(prec = list(initial = log(1/0.024), fixed = TRUE))
+```
+
+## INLA control options
+
+```{r}
+
+control.family    = list(hyper = hyper.bgev, control.bgev = control.bgev)
+control.predictor = list(compute = TRUE)
+control.compute   = list(cpo = T, dic = F, waic = T, config = F)
+control.inla      = list(strategy = "simplified.laplace", int.strategy = "eb")
+```
+
+## build INLA input
+
+```{r}
+spread.x <- matrix(1, nrow(data.train), 1)
+tail.x   <- matrix(1, nrow(data.train), 1)
+
+data.bgev = data.frame(data.train, 
+                       intercept = 1,
+                       spread.x = spread.x,
+                       tail.x = tail.x)
+```
+
+## Define the model formula
+
+```{r}
+formula = inla.mdata(maxOzone, spread.x, tail.x) ~ -1 +
+  intercept +
+  year +
+  f(month,
+   model = "rw2",
+   cyclic = TRUE,
+   hyper = hyper.month,
+   scale.model = TRUE) +
+  minTemp + maxTemp + windSpeed + rainSum
+
+```
+
+## Fit the model
+
+```{r}
+fit.bgev.2 = inla(formula,
+               family = "bgev",
+               data   = data.bgev,
+               control.family    = control.family,
+               control.predictor = control.predictor,
+               control.compute   = control.compute,
+               control.inla      = control.inla,
+               verbose           = F) 
+```
+
+## Save and reload the model
+
+```{r}
+saveRDS(fit.bgev.2, file = "bGEV_temporal_weekly_model_32_stations.rds")
+```
+
+```{r}
+fit.bgev.2 = readRDS(file = "bGEV_temporal_weekly_model_32_stations.rds")
+```
+
+
+
+## Summaries
+
+```{r}
+round(fit.bgev.2$summary.fixed, 4)
+```
+
+```{r}
+round(fit.bgev.2$summary.hyperpar, 4)
+
+```
+
+
+```{r}
+round(fit.bgev.2$summary.random$month,4)
+```
+
+
+## Plot fixed effect posterior means
+
+```{r}
+library(ggplot2)
+
+fixed <- fit.bgev.2$summary.fixed
+fixed$param <- rownames(fixed)
+
+ggplot(fixed, aes(x = param, y = mean)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = `0.025quant`, ymax = `0.975quant`)) +
+  geom_hline(yintercept = 0, color="red", size=0.5) +
+  coord_flip() +
+  ggtitle("parameters of the model")
+```
+
+## PIT histogram
+
+```{r}
+hist(fit.bgev.2$cpo$pit, breaks = 50, main = "PIT histogram", xlab = "PIT")
+
+```
+
+## Posterior marginals for spread and tail
+
+```{r}
+plot_marginal <- function(marg, main="") {
+  plot(
+    marg,
+    type = "l",
+    lwd = 2,
+    xlab = "Parameter value",
+    ylab = "Density",
+    main = main
+  )
+}
+par(mfrow=c(2,1))
+
+plot_marginal(fit.bgev$marginals.hyperpar[["spread for BGEV observations"]], "Spread σ")
+plot_marginal(fit.bgev$marginals.hyperpar[["tail for BGEV observations"]], "Tail ξ")
+
+
+```
+
+## Seasonal effect plot
+
+```{r}
+library(ggplot2)
+
+month_effect <- fit.bgev.2$summary.random$month
+month_effect$month <- month_effect$ID
+
+ggplot(month_effect, aes(x = month, y = mean)) +
+  geom_line() +
+  geom_ribbon(aes(ymin = `0.025quant`, ymax = `0.975quant`), alpha = .2) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(title = "Seasonal effect of month",
+       y = "Effect on maxOzone (latent scale)",
+       x = "Month")
+```
+
+
+## Predictions
+
+```{r}
+spread.x <- matrix(1, nrow(data.test), 1)
+tail.x   <- matrix(1, nrow(data.test), 1)
+
+data.pred.bgev = data.frame(data.test, 
+                       intercept = 1,
+                       spread.x = spread.x,
+                       tail.x = tail.x)
+
+
+```
+
+```{r}
+formula = inla.mdata(maxOzone, spread.x, tail.x) ~ -1 + intercept + year + f(month, model = 'rw2', hyper = hyper.month, cyclic = cyclic, scale.model = TRUE) + minTemp + maxTemp + windSpeed + rainSum
+```
+
+
+```{r}
+pred.bgev = inla(
+  formula,
+  family = "bgev",
+  data = data.pred.bgev,
+  control.family    = fit.bgev.2$control.family,
+  control.mode      = list(theta = fit.bgev.2$mode$theta, restart = FALSE),
+  control.predictor = list(compute = TRUE),
+  control.compute   = list(config = TRUE),  # required for samples
+  control.inla      = list(strategy = "simplified.laplace")
+)
+```
+
+
+```{r}
+pred_mean = pred.bgev$summary.fitted.values$mean
+pred_lower = pred.bgev$summary.fitted.values$`0.025quant`
+pred_upper = pred.bgev$summary.fitted.values$`0.975quant`
+
+pred.df.2 = data.frame(
+  idSensor = data.test$idSensor,
+  date  = as.Date(data.test$week),
+  observed = data.test$maxOzone,
+  pred_mean  = pred_mean,
+  pred_lower = pred_lower,
+  pred_upper = pred_upper
+)
+
+
+```
+
+
+```{r}
+
+ggplot(pred.df.2[pred.df.2$idSensor == 5707,], aes(x = date, group=idSensor)) +
+  geom_line(aes(  y = observed, colour = "observed")) +
+  geom_line(aes( y = pred_mean, colour = "predicted")) +
+  geom_ribbon(aes(ymin = pred_lower, ymax = pred_upper), alpha = 0.2) +
+  ggtitle("sensor 5707: temporal model")
+```
+
+
+```{r}
+ggplot(pred.df[pred.df$idSensor == 6582,], aes(x = date, group=idSensor)) +
+  geom_line(aes(  y = observed, colour = "observed")) +
+  geom_line(aes( y = pred_mean, colour = "predicted")) +
+  geom_ribbon(aes(ymin = pred_lower, ymax = pred_upper), alpha = 0.2) +
+  ggtitle("sensor 6582")
+
+```
+
+```{r}
+ggplot(pred.df[pred.df$idSensor == 9856,], aes(x = date, group=idSensor)) +
+  geom_line(aes(  y = observed, colour = "observed")) +
+  geom_line(aes( y = pred_mean, colour = "predicted")) +
+  geom_ribbon(aes(ymin = pred_lower, ymax = pred_upper), alpha = 0.2) +
+  ggtitle("sensor 9856")
+
+```
+
+
+
+## --- Predictive intervals via posterior simulation ---
+
+Predictive intervals quantify the full uncertainty of future observations by combining parameter uncertainty and the inherent variability of the process.
+Unlike confidence intervals on model parameters, they indicate the range in which new observations are expected to fall with a given probability.
+
+```{r}
+library(sn)
+
+set.seed(123)
+n_sims <- 1000
+
+# Draw posterior samples of the latent predictor
+samples <- inla.posterior.sample(
+  n = n_sims,
+  result = pred.bgev
+)
+
+# Extract linear predictors
+eta_samples <- sapply(samples, function(s)
+  s$latent[grep("^Predictor", rownames(s$latent))]
+)
+
+# Posterior means of hyperparameters
+xi_hat    <- fit.bgev.2$summary.hyperpar["tail for BGEV observations","mean"]
+sigma_hat <- fit.bgev.2$summary.hyperpar["spread for BGEV observations","mean"]
+
+# Simulate observations
+y_rep <- matrix(NA, nrow = n_sims, ncol = nrow(eta_samples))
+
+for (i in 1:n_sims) {
+  mu_i <- eta_samples[, i]
+  y_rep[i, ] <- rgev(
+    length(mu_i),
+    loc   = mu_i,
+    scale = sigma_hat,
+    shape = xi_hat
+  )
+}
+
+# Predictive intervals
+pred_PI <- apply(y_rep, 2, quantile, probs = c(0.025, 0.5, 0.975))
+
+pred.df$pred_PI_lower <- pred_PI[1, ]
+pred.df$pred_PI_median <- pred_PI[2, ]
+pred.df$pred_PI_upper <- pred_PI[3, ]
+```
+
+```{r}
+ggplot(pred.df[pred.df$idSensor == 5707,], aes(x = date)) +
+  geom_line(aes(y = observed, colour = "observed") )+
+  geom_line(aes(y = pred_PI_median, colour = "predicted") )+
+  geom_ribbon(
+    aes(ymin = pred_PI_lower, ymax = pred_PI_upper),
+    fill = "blue", alpha = 0.3
+  ) +
+  ggtitle("Predictive intervals (sensor 5707)")
+```
+The predicted mean captures the seasonal ozone pattern well. Predictive intervals are wide, which is expected for extreme-value models and reflect natural variability. Most observations lie within the intervals, indicating good overall predictive calibration.
+
+## --- GEV Probability Integral Transform ---
+
+Q–Q (PIT) plots assess how well the model’s predicted distribution matches the observed data.
+Points close to the diagonal indicate good calibration, while systematic deviations reveal under- or overestimation in certain parts of the distribution.
+
+```{r}
+mu_hat <- pred.bgev$summary.fitted.values$mean
+xi_hat <- fit.bgev.2$summary.hyperpar["tail for BGEV observations","mean"]
+sigma_hat <- fit.bgev.2$summary.hyperpar["spread for BGEV observations","mean"]
+
+pit_gev <- pgev(
+  pred.df$observed,
+  loc   = mu_hat,
+  scale = sigma_hat,
+  shape = xi_hat
+)
+
+qqplot(
+  qunif(ppoints(length(pit_gev))),
+  sort(pit_gev),
+  main = "GEV Q–Q plot (PIT)",
+  xlab = "Theoretical quantiles",
+  ylab = "Empirical PIT"
+)
+abline(0, 1, col = "red")
+```
+Center: points are close to the diagonal
+→ the model is well calibrated for typical values.
+
+Lower probabilities (left tail): points lie above the diagonal
+→ the model slightly overestimates low values (lower tail too heavy).
+
+Higher probabilities (right tail): points lie below the diagonal
+→ the model underestimates extreme high values (upper tail too light).
+
+## --- Extreme quantile coverage ---
+
+Coverage at a given quantile (e.g., 95%) measures the proportion of observed values below that predictive quantile.
+Values close to the nominal probability indicate well-calibrated extremes, while values too high or low reveal over- or underestimation.
+
+```{r}
+q95 <- qgev(
+  0.95,
+  loc   = mu_hat,
+  scale = sigma_hat,
+  shape = xi_hat
+)
+
+coverage_95 <- mean(pred.df$observed <= q95)
+
+coverage_95
+```
+coverage_95 = 1 means that all observations fall below the model’s 95% predictive quantile.
+This indicates an overly conservative model, with the upper tail (or dispersion) being overestimated.
+
+
+# Model Comparaison
+
+## WAIC
+
+```{r}
+fit.bgev.1$waic$waic
+
+```
+The second model with trend and seasonality has a better predictive fit.
+
+## PIT
+
+```{r}
+pit1 <- fit.bgev.1$cpo$pit
+pit2 <- fit.bgev.2$cpo$pit
+
+pit1 <- pit1[is.finite(pit1)]
+pit2 <- pit2[is.finite(pit2)]
+
+par(mfrow = c(1,2))
+
+hist(pit1, breaks = 20, freq = FALSE,
+     main = "PIT – heteroskedastic model",
+     xlab = "PIT")
+
+hist(pit2, breaks = 20, freq = FALSE,
+     main = "PIT – temporal model",
+     xlab = "PIT")
+
+```
+
+```{r}
+thr <- quantile(data.train$maxOzone, 0.95)
+
+pit1_tail <- pit1[data.train$maxOzone > thr]
+pit2_tail <- pit2[data.train$maxOzone > thr]
+
+hist(pit1_tail, breaks = 10, freq = FALSE,
+     main = "Tail PIT – Model 1")
+
+hist(pit2_tail, breaks = 10, freq = FALSE,
+     main = "Tail PIT – Model 2")
+
+```
+
+
+
