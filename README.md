@@ -21,7 +21,7 @@ The GEV distribution depends on 3 parameters: the location, the spread and the t
   - a heteroskedastic model
   - a hybrid model
 
-A comparison between INLA and STAN implementation have also been conducted.
+A comparison between INLA and STAN implementation have also been conducted (see the report for more details).
 
 ## Data
 
@@ -37,9 +37,24 @@ The following weekly meteorogical covariates were collected from Open-Meteo for 
 
 ### Temporal model
 
-In this model, the location parameter shows a linear component for the meteorogical covariates and the year and cyclic second-order random walk for the monthly seasonal component. The spread and tail parameters are covariates free
+In this model, the location parameter shows a linear component for the meteorogical covariates and the year and cyclic second-order random walk for the monthly seasonal component. The spread and tail parameters are covariate free.
 
+From this model fitted on the data, we concluded that:
+  - Hot conditions strongly enhance ozone concentrations.
+  - Precipitations reduces ozone extremes
+  - Clear annual pattern with a peak in late spring and a minimum in autumn.
+  - Exponential type tail indicates extreme ozone events are rare.
 
+### Heteroskedastic Model
+
+In this model, the temporal components were removed from the location parameter, so that it only depends on meteorological covariates. The spread parameter integrate meteorigical covariates. The tail stays covariate free.
+
+Our conclusions were:
+  - Similar meteorological effect on the location parameter than the previous model. Though, the maximum temperature shows a lower effect with the
+extreme behaviour now explained by variance inflation rather than a shift in the median.
+  - No effect of the temperature on the dispersion of ozone value.
+  - The wind tends to reduce the ozone extreme variability.
+  - The precipitation tends to increase the variability while lowering the mean.
 
 ## Credits
 
