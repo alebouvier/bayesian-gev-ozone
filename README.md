@@ -45,6 +45,14 @@ From this model fitted on the data, we concluded that:
   - Clear annual pattern with a peak in late spring and a minimum in autumn.
   - Exponential type tail indicates extreme ozone events are rare.
 
+
+
+<figure>
+<img src="images/seasonality_effect.png" alt="Example Image" width="750">
+<figcaption>Figure 1: Seasonality effect on the location parameter</figcaption>
+</figure>
+
+
 ### Heteroskedastic Model
 
 In this model, the temporal components were removed from the location parameter, so that it only depends on meteorological covariates. The spread parameter integrate meteorigical covariates. The tail stays covariate free.
@@ -55,6 +63,35 @@ extreme behaviour now explained by variance inflation rather than a shift in the
   - No effect of the temperature on the dispersion of ozone value.
   - The wind tends to reduce the ozone extreme variability.
   - The precipitation tends to increase the variability while lowering the mean.
+
+
+<figure>
+<img src="images/posterior_distributions_spread_tail.png" alt="Example Image" width="750">
+<figcaption>Figure 2: Posterior densities of spread and tail parameters</figcaption>
+</figure>
+
+
+### Hybrid Model
+
+In this model, the location depends on meteorological covariates and temporal components like in the first model. The spread parameter depends on meteorological covariates as well like in the second model. The tail parameter stays covariate free.
+
+Our conclusions:
+  - Clear seasonality pattern
+  - Hot conditions strongly increase ozone maxima
+  - Wind tends to stabilize the ozone extremes
+  - Precipitations increase the variability but lower the mean.
+  - the distribution tail is exponential.
+
+### Limitations
+
+The three models shows an underestimation of ozone levels during extreme peaks. This indicates that our models are too conservative. It can be explain by the use of penalized complexity priors for the tail parameter that is too strict.
+ 
+ <figure>
+<img src="images/predictions.png" alt="Example Image" width="750">
+<figcaption>Figure 3: Observed vs predicted weekly maximum ozone</figcaption>
+</figure>
+
+ 
 
 ## Credits
 
